@@ -10,7 +10,9 @@ const APP_URL = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
 export const dynamic = "force-dynamic";
 
 export default async function LandingPage() {
-  await seedAdminUser();
+  if (process.env.NEXT_PHASE !== "phase-production-build") {
+    await seedAdminUser();
+  }
 
   return (
     <main className="relative min-h-screen w-full overflow-x-hidden bg-[var(--bg-cosmic)] text-[var(--text-primary)]">
