@@ -1,422 +1,247 @@
-import React from "react";
-import { DownloadHub } from "@/components/marketing/download-hub";
-import { FAQSection } from "@/components/marketing/faq-section";
-import { TestimonialsSection } from "@/components/marketing/testimonials-section";
-import { Sparkles, Terminal, Shield, Cpu, ArrowRight } from "lucide-react";
-import { seedAdminUser } from "../lib/seedAdmin";
+// Implements: docs/design/overhaul-plan.md §4.1 (front door) on web/07_Landing_Page.md
+// §2.1 (force-static + 1h ISR) + product/02–05 copy, on the claims-audit pass
+// (docs/design/marketing-claims-audit.md) that removed the last unsupported
+// capability claim from this route.
+// v3: restyled onto the generated tokens (material-modes.md §2). The stats
+// strip still reads gateway facts only (R-17, no hardcoded numbers); the price
+// claim that used to live here is gone because this surface no longer states
+// prices (overhaul-plan.md §4.1: prices are set on the owner's replacement
+// list, and /pricing owns the plan matrix).
+// Route-reachability pass: the Attendance line now states the two-tap mechanism
+// rather than a headcount and a duration, because no in-repo benchmark supports
+// that pairing (audit row 9); the facts strip gained a visible heading so it is
+// read as an assertion rather than decoration.
+// Funnel pass: the decision panel's primary is now free self-serve sign-up and
+// the access request is the quiet action beside it, because the request
+// endpoint persists and delivers nothing (audit §4.1 option (b)). `dynamic` and
+// `revalidate` below are unchanged — a smoke test asserts both.
 
-const APP_URL = process.env.NEXT_PUBLIC_APP_URL || "http://localhost:3000";
+import { ProductHero } from "@/components/product-3d/ProductHero";
+import Link from "next/link";
+import {
+  APP_LOGIN_URL,
+  APP_SIGNUP_URL,
+  CONTRACTED_PLAN_CTA,
+  FREE_SIGNUP_CTA,
+  FREE_SIGNUP_NOTE,
+} from "@/lib/access-request";
 
-export const dynamic = "force-dynamic";
+export const dynamic = "force-static";
+export const revalidate = 3600;
 
-export default async function LandingPage() {
+interface MarketingStats {
+  screens: number;
+  engines: number;
+  guarantees: string[];
+  platforms: string[];
+}
+
+/** Gateway guarantee keys → the sentence a visitor reads. The keys are the
+ *  contract (apps/gateway/routes/marketing.ts:16); this is presentation, and an
+ *  unknown key still renders rather than disappearing (Rule 9). */
+const GUARANTEE_LABEL: Readonly<Record<string, string>> = {
+  "offline-first": "Offline first",
+  "no-telemetry": "No telemetry, ever",
+  "single-tenant-sqlite": "One tutor, one database",
+  "append-only-ledger": "Append-only ledger",
+};
+
+function guaranteeSentence(key: string): string {
+  const known = GUARANTEE_LABEL[key];
+  if (known) return known;
+  return key.replace(/-/g, " ").replace(/^./, (c) => c.toUpperCase());
+}
+
+async function getStats(): Promise<MarketingStats | null> {
+  const base = process.env.MARKETING_STATS_URL ?? "https://api.buddysaradhi.app";
   try {
-    if (process.env.NEXT_PHASE !== "phase-production-build") {
-      await seedAdminUser();
+    const res = await fetch(`${base}/api/v1/marketing/stats`, { next: { revalidate: 3600 } });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { success: boolean; data: MarketingStats };
+    if (!body.success) return null;
+    return body.data;
+  } catch {
+    return null;
+  }
+}
+
+/** The facts that hold without asking a server. If the gateway is unreachable
+ *  these are all we can state, and we say so rather than shipping a shorter
+ *  strip that reads as a deliberate list (claims-audit row 1). */
+const BASE_FACTS: readonly string[] = ["Built in India", "No telemetry, ever", "Offline first"];
+
+
+const SCREENS = [
+  {
+    name: "Dashboard",
+    line: "The month at a glance. Collected, due, and what is due today.",
+  },
+  {
+    name: "Students",
+    line: "Every student, every batch, one roster you can search without leaving the screen.",
+  },
+  {
+    name: "Attendance",
+    line: "One tap marks the batch present, the next tap locks the day, and the record is authoritative from then on.",
+  },
+  {
+    name: "Fees",
+    line: "Every fee recorded, every receipt numbered, nothing editable after the fact.",
+  },
+  {
+    name: "Settings",
+    line: "Backup, PIN, and your data under your control. The screen that keeps the other four honest.",
+  },
+] as const;
+
+export default async function ProductPage() {
+  const stats = await getStats();
+
+  // Verified facts only, in a stable order, de-duplicated: the gateway repeats
+  // two of our base facts in `guarantees`, and a strip that says "offline first"
+  // twice reads as filler rather than as two sources agreeing.
+  const facts: string[] = [...BASE_FACTS];
+  if (stats) {
+    const claimed = [
+      `${stats.screens} screens`,
+      `${stats.engines} engines`,
+      ...stats.guarantees.map(guaranteeSentence),
+    ];
+    for (const claim of claimed) {
+      const dup = facts.some((f) => f.toLowerCase() === claim.toLowerCase());
+      if (!dup && !facts.includes(claim)) facts.push(claim);
     }
-  } catch (error) {
-    console.warn("Failed to seed admin user (expected during build or serverless init):", error);
   }
 
   return (
-    <main className="relative min-h-screen w-full overflow-x-hidden bg-[var(--bg-cosmic)] text-[var(--text-primary)]">
-      
-      {/* Liquid Glass Background (Highly responsive CSS animated gradient mesh) */}
-      <div className="fixed inset-0 pointer-events-none overflow-hidden z-0 bg-[#060414]">
-        {/* Animated Bioluminescent Blobs */}
-        <div className="absolute top-[5%] left-[5%] w-[45vw] h-[45vw] rounded-full filter blur-[100px] opacity-[0.15] animate-blob-1 bg-[#00FF9D]" />
-        <div className="absolute bottom-[10%] right-[5%] w-[50vw] h-[50vw] rounded-full filter blur-[120px] opacity-[0.15] animate-blob-2 bg-[#00F0FF]" />
-        <div className="absolute top-[35%] right-[25%] w-[35vw] h-[35vw] rounded-full filter blur-[90px] opacity-[0.12] animate-blob-3 bg-[#B388FF]" />
-        
-        {/* Futuristic SVG Grid Pattern Overlay */}
-        <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.015)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.015)_1px,transparent_1px)] bg-[size:40px_40px] opacity-[0.25] [mask-image:radial-gradient(ellipse_60%_50%_at_50%_50%,#000_70%,transparent_100%)]" />
-      </div>
+    <>
+      <ProductHero />
 
-      {/* Header / Navbar */}
-      <header className="topbar sticky top-0 z-30">
-        <a
-          href="/"
-          className="flex items-center gap-2 font-[family-name:var(--font-heading)] text-lg font-semibold text-[var(--text-primary)] no-underline"
-          aria-label="buddysaradhi home"
+      <section aria-labelledby="facts-heading" className="px-6 py-5">
+        {/* A visible heading, because an unlabelled list of facts reads as
+            decoration rather than as something the page is asserting. */}
+        <h2
+          id="facts-heading"
+          className="text-center text-sm font-semibold text-pretty"
+          style={{ color: "var(--text-secondary)" }}
         >
-          <span
-            aria-hidden="true"
-            className="h-2 w-2 rounded-full bg-[var(--accent-emerald)] shadow-[0_0_12px_color-mix(in_srgb,var(--accent-emerald)_70%,transparent)] animate-pulse"
-          />
-          buddysaradhi
-        </a>
-        <nav aria-label="Primary" className="flex items-center gap-4">
-          <a
-            href={`${APP_URL}/login`}
-            className="inline-flex min-h-[44px] items-center px-5 rounded-full glass-strong text-[var(--text-primary)] text-sm font-medium no-underline transition-all hover:text-[var(--accent-emerald)] hover:border-[var(--accent-emerald)]/30 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent-cyan)] focus-visible:ring-offset-2"
-          >
-            Sign in
-          </a>
-        </nav>
-      </header>
+          What we can back up
+        </h2>
+        <ul
+          className="mt-3 flex flex-wrap items-center justify-center gap-x-6 gap-y-2 text-sm"
+          style={{ color: "var(--text-muted)" }}
+        >
+          {facts.map((f) => (
+            <li key={f}>{f}</li>
+          ))}
+        </ul>
+      </section>
 
-      {/* Hero Section */}
-      <section className="relative z-10 mx-auto flex min-h-[calc(100vh-64px)] max-w-5xl flex-col items-center justify-center px-6 py-20 text-center">
-        <span className="chip chip-info mb-6">
-          <span className="chip-dot" aria-hidden="true" />
-          The tuition-business OS
-        </span>
+      {/* Degraded load is stated, never hidden. A strip that quietly renders three
+          facts instead of nine reads as a deliberate list, and the visitor cannot
+          tell that the counts were withheld (docs/design/marketing-claims-audit.md
+          row 1). This only renders when the gateway did not answer. It also names
+          the freshness boundary: `revalidate = 3600` means even a checked figure
+          can be up to an hour old, and a visitor is entitled to know that. */}
+      {stats === null && (
+        <p className="mx-auto w-full max-w-[62ch] px-6 pb-6 text-center text-sm text-pretty text-[var(--text-muted)]">
+          Every fact above holds on its own. The screen and engine counts and the architecture
+          guarantees come from our live API rather than this page, and it did not answer — so we
+          are not showing facts we cannot check. This page takes a fresh reading of that API at
+          most once an hour, so a checked figure can still be an hour old.
+        </p>
+      )}
 
-        <h1 className="font-[family-name:var(--font-heading)] text-5xl md:text-7xl lg:text-8xl font-semibold tracking-tight leading-[1.05] [text-wrap:balance] gradient-text pb-2">
-          Run a tuition business from five screens.
-        </h1>
-
-        <p className="mt-8 max-w-2xl glass-faint rounded-full py-3 px-8 text-[var(--text-secondary)] font-medium text-sm md:text-base border border-[var(--border-glass)]/20 shadow-[0_4px_12px_rgba(0,0,0,0.15)]">
-          Five screens. Seven engines. One ledger. Zero servers to manage.
+      <section id="screens" aria-label="Five screens" className="mx-auto w-full max-w-6xl px-6 py-16">
+        <h2 className="font-display text-3xl font-bold text-balance md:text-4xl">
+          Five screens. Nothing else to learn.
+        </h2>
+        <p className="mt-4 max-w-[68ch] text-pretty text-[var(--text-secondary)]">
+          A tutor opens one screen to mark the day, one screen to take a fee, and one screen at
+          month end to see what is still owed. There is no sixth screen to learn.
         </p>
 
-        {/* Interactive Neumorphic Buttons */}
-        <div className="mt-10 flex flex-col gap-4 sm:flex-row sm:gap-4 items-center">
-          <a
-            href={`${APP_URL}/signup`}
-            className="inline-flex min-h-[52px] w-56 items-center justify-center rounded-xl bg-[var(--accent-emerald)] text-[var(--text-on-accent)] font-bold text-base no-underline shadow-[0_8px_32px_rgba(0,255,157,0.25),inset_0_1px_0_rgba(255,255,255,0.3)] hover:brightness-110 active:translate-y-[1px] transition-all"
-          >
-            Get started — free
-          </a>
-          <a
-            href="#features"
-            className="inline-flex min-h-[52px] w-56 items-center justify-center rounded-xl glass-strong border border-[var(--border-glass)] text-[var(--text-primary)] font-bold text-base no-underline hover:bg-[var(--surface-glass-strong)] active:translate-y-[1px] transition-all"
-          >
-            Explore features
-          </a>
-        </div>
-
-        {/* Live App Statistics (Sovereign KPIs) */}
-        <dl className="mt-16 glass-faint rounded-2xl border border-[var(--border-glass)]/20 px-8 py-4 flex flex-wrap justify-center gap-x-8 gap-y-2 text-xs md:text-sm text-[var(--text-secondary)] shadow-lg">
-          <div className="flex items-center gap-1.5">
-            <span className="font-mono font-bold text-[var(--accent-emerald)] text-lg">5</span>
-            <span>screens</span>
-          </div>
-          <span aria-hidden="true" className="text-[var(--text-muted)] self-center hidden sm:inline">&middot;</span>
-          <div className="flex items-center gap-1.5">
-            <span className="font-mono font-bold text-[var(--accent-cyan)] text-lg">7</span>
-            <span>engines</span>
-          </div>
-          <span aria-hidden="true" className="text-[var(--text-muted)] self-center hidden sm:inline">&middot;</span>
-          <div className="flex items-center gap-1.5">
-            <span className="font-mono font-bold text-[var(--accent-violet)] text-lg">1</span>
-            <span>ledger</span>
-          </div>
+        {/* A definition list, not four identical cards: the sequence is the
+            claim, so the names are the structure. */}
+        <dl className="mt-10 overflow-hidden rounded-panel border border-[var(--border-default)]">
+          {SCREENS.map((s, i) => (
+            <div
+              key={s.name}
+              className="row grid gap-1 px-5 py-5 md:grid-cols-[12rem_1fr] md:gap-6"
+            >
+              <dt className="font-display text-lg font-semibold">
+                {s.name}
+                {i === SCREENS.length - 1 && (
+                  <span className="ml-3 text-sm font-medium" style={{ color: "var(--accent-primary)" }}>
+                    Screen 5 of 5
+                  </span>
+                )}
+              </dt>
+              <dd className="text-pretty text-[var(--text-secondary)]">{s.line}</dd>
+            </div>
+          ))}
         </dl>
       </section>
 
-      {/* Product Feature Cards Section */}
-      <section id="features" className="relative z-10 mx-auto max-w-6xl px-6 py-24">
-        <div className="text-center max-w-3xl mx-auto mb-16">
-          <span className="eyebrow text-xs tracking-widest font-semibold uppercase text-[var(--accent-cyan)]">Built for the way you actually tutor</span>
-          <h2 className="mt-3 font-[family-name:var(--font-heading)] text-4xl md:text-5xl font-semibold tracking-tight [text-wrap:balance] text-[var(--text-primary)]">
-            Everything you need. Nothing you don&apos;t.
-          </h2>
-          <p className="mt-4 text-[var(--text-secondary)]">
-            A complete tuition-business operating system. Offline-first, secure local SQLite databases, zero tracking, zero configuration.
-          </p>
-        </div>
-
-        <div className="grid gap-8 md:grid-cols-3">
-          {/* Card 1 */}
-          <article className="glass-strong rounded-3xl p-8 border border-[var(--border-glass)] flex flex-col justify-between hover:border-[var(--accent-cyan)]/30 transition-all duration-300">
-            <div>
-              <div className="w-12 h-12 rounded-2xl bg-[var(--accent-cyan)]/10 text-[var(--accent-cyan)] flex items-center justify-center mb-6">
-                <Cpu className="w-6 h-6" />
-              </div>
-              <h3 className="font-[family-name:var(--font-heading)] text-2xl font-bold text-[var(--text-primary)]">
-                Always one tap away
-              </h3>
-              <p className="mt-4 text-sm text-[var(--text-secondary)] leading-relaxed">
-                Dashboard, Students, Attendance, Fees & Payments, Settings. Clean, high-density dashboard layouts optimized for mobile and desktop screens.
-              </p>
-            </div>
-            <ul className="mt-8 flex flex-wrap gap-2 text-[10px]">
-              <li className="chip chip-info">Dashboard</li>
-              <li className="chip chip-info">Students</li>
-              <li className="chip chip-info">Attendance</li>
-              <li className="chip chip-info">Fees</li>
-              <li className="chip chip-info">Settings</li>
-            </ul>
-          </article>
-
-          {/* Card 2 */}
-          <article className="glass-strong rounded-3xl p-8 border border-[var(--border-glass)] flex flex-col justify-between hover:border-[var(--accent-emerald)]/30 transition-all duration-300">
-            <div>
-              <div className="w-12 h-12 rounded-2xl bg-[var(--accent-emerald)]/10 text-[var(--accent-emerald)] flex items-center justify-center mb-6">
-                <Terminal className="w-6 h-6" />
-              </div>
-              <h3 className="font-[family-name:var(--font-heading)] text-2xl font-bold text-[var(--text-primary)]">
-                Quiet background engines
-              </h3>
-              <p className="mt-4 text-sm text-[var(--text-secondary)] leading-relaxed">
-                Seven core services run quietly behind the scenes handling incremental search indexes, transaction audits, attendance locks, notifications, and instant LibSQL database sync.
-              </p>
-            </div>
-            <ul className="mt-8 flex flex-wrap gap-2 text-[10px]">
-              <li className="chip chip-success">Search</li>
-              <li className="chip chip-success">Sync</li>
-              <li className="chip chip-success">Ledger</li>
-              <li className="chip chip-success">Reminders</li>
-            </ul>
-          </article>
-
-          {/* Card 3 */}
-          <article className="glass-strong rounded-3xl p-8 border border-[var(--border-glass)] flex flex-col justify-between hover:border-[var(--accent-violet)]/30 transition-all duration-300">
-            <div>
-              <div className="w-12 h-12 rounded-2xl bg-[var(--accent-violet)]/10 text-[var(--accent-violet)] flex items-center justify-center mb-6">
-                <Shield className="w-6 h-6" />
-              </div>
-              <h3 className="font-[family-name:var(--font-heading)] text-2xl font-bold text-[var(--text-primary)]">
-                100% Sovereign Data
-              </h3>
-              <p className="mt-4 text-sm text-[var(--text-secondary)] leading-relaxed">
-                No telemetry tracking. No analytics SDKs. Every tutor gets a private LibSQL database instance. Backups are envelope-encrypted with AES-256-GCM using your private passphrase.
-              </p>
-            </div>
-            <ul className="mt-8 flex flex-wrap gap-2 text-[10px]">
-              <li className="chip chip-warning">No tracking</li>
-              <li className="chip chip-warning">AES-256-GCM</li>
-              <li className="chip chip-warning">Offline-first</li>
-            </ul>
-          </article>
-        </div>
-      </section>
-
-      {/* Download Hub */}
-      <DownloadHub />
-
-      {/* Pricing Section */}
-      <section id="pricing" className="relative z-10 mx-auto max-w-6xl px-6 py-24 border-t border-[var(--border-glass)]">
-        <div className="text-center max-w-3xl mx-auto mb-16">
-          <span className="eyebrow text-xs tracking-widest font-semibold uppercase text-[var(--accent-cyan)]">Pricing</span>
-          <h2 className="mt-3 font-[family-name:var(--font-heading)] text-4xl md:text-5xl font-semibold tracking-tight [text-wrap:balance] text-[var(--text-primary)]">
-            Start free. Upgrade as you grow.
-          </h2>
-          <p className="mt-4 text-[var(--text-secondary)]">
-            Full-featured, free forever for up to 60 students. Simple monthly pricing for growing institutes.
-          </p>
-        </div>
-
-        <div className="grid gap-8 md:grid-cols-3 max-w-6xl mx-auto">
-          {/* Free Tier */}
-          <article className="glass rounded-3xl p-8 border border-[var(--border-glass)] flex flex-col justify-between">
-            <div>
-              <span className="chip chip-neutral mb-4">Free Plan</span>
-              <h3 className="font-[family-name:var(--font-heading)] text-3xl font-bold text-[var(--text-primary)] flex items-baseline gap-2">
-                ₹0
-                <span className="text-sm font-normal text-[var(--text-muted)] font-[family-name:var(--font-body)]">/mo</span>
-              </h3>
-              <p className="mt-4 text-sm text-[var(--text-secondary)] leading-relaxed">
-                Perfect for independent tutors and small batches. Includes 5-screen interface and fallback SQL search.
-              </p>
-              <ul className="mt-8 space-y-3 text-sm text-[var(--text-secondary)]">
-                <li className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-emerald)]" />
-                  Up to 60 active students
-                </li>
-                <li className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-emerald)]" />
-                  Up to 3 active batches
-                </li>
-                <li className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-emerald)]" />
-                  All 5 core management screens
-                </li>
-              </ul>
-            </div>
-            <a
-              href={`${APP_URL}/signup`}
-              className="mt-10 inline-flex min-h-[48px] items-center justify-center rounded-xl border border-[var(--border-glass)] text-[var(--text-primary)] font-bold text-sm no-underline hover:bg-[var(--surface-glass)] transition-all"
-            >
-              Start Free Plan
-            </a>
-          </article>
-
-          {/* Growth Tier */}
-          <article className="glass-strong rounded-3xl p-8 border border-[var(--accent-emerald)]/30 flex flex-col justify-between relative overflow-hidden shadow-[0_12px_48px_rgba(0,255,157,0.1)]">
-            <div className="absolute top-0 right-0 bg-[var(--accent-emerald)] text-[var(--text-on-accent)] font-bold text-[10px] tracking-wider uppercase px-4 py-1.5 rounded-bl-2xl">
-              Recommended
-            </div>
-            <div>
-              <span className="chip chip-success mb-4">Growth Plan</span>
-              <h3 className="font-[family-name:var(--font-heading)] text-3xl font-bold text-[var(--text-primary)] flex items-baseline gap-2">
-                ₹499
-                <span className="text-sm font-normal text-[var(--text-muted)] font-[family-name:var(--font-body)]">/mo</span>
-              </h3>
-              <p className="mt-4 text-sm text-[var(--text-secondary)] leading-relaxed">
-                For active tutors who run multiple batches. Adds vector search and multi-device database sync.
-              </p>
-              <ul className="mt-8 space-y-3 text-sm text-[var(--text-secondary)]">
-                <li className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-emerald)]" />
-                  Up to 300 active students
-                </li>
-                <li className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-emerald)]" />
-                  Up to 10 active batches
-                </li>
-                <li className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-emerald)]" />
-                  HNSW Vector Search engine
-                </li>
-              </ul>
-            </div>
-            <a
-              href={`${APP_URL}/signup`}
-              className="mt-10 inline-flex min-h-[48px] items-center justify-center rounded-xl bg-[var(--accent-emerald)] text-[var(--text-on-accent)] font-bold text-sm no-underline hover:brightness-110 transition-all"
-            >
-              Start Growth Plan
-            </a>
-          </article>
-
-          {/* Institute Tier */}
-          <article className="glass rounded-3xl p-8 border border-[var(--border-glass)] flex flex-col justify-between">
-            <div>
-              <span className="chip chip-neutral mb-4">Institute Plan</span>
-              <h3 className="font-[family-name:var(--font-heading)] text-3xl font-bold text-[var(--text-primary)] flex items-baseline gap-2">
-                ₹1,499
-                <span className="text-sm font-normal text-[var(--text-muted)] font-[family-name:var(--font-body)]">/mo</span>
-              </h3>
-              <p className="mt-4 text-sm text-[var(--text-secondary)] leading-relaxed">
-                For established academies. Adds unlimited limits, multi-tutor roles, and priority database syncing.
-              </p>
-              <ul className="mt-8 space-y-3 text-sm text-[var(--text-secondary)]">
-                <li className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-emerald)]" />
-                  Unlimited active students
-                </li>
-                <li className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-emerald)]" />
-                  Unlimited batches & tutors
-                </li>
-                <li className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-[var(--accent-emerald)]" />
-                  Priority Sync + Premium Support
-                </li>
-              </ul>
-            </div>
-            <a
-              href={`${APP_URL}/signup`}
-              className="mt-10 inline-flex min-h-[48px] items-center justify-center rounded-xl border border-[var(--border-glass)] text-[var(--text-primary)] font-bold text-sm no-underline hover:bg-[var(--surface-glass)] transition-all"
-            >
-              Start Institute Plan
-            </a>
-          </article>
-        </div>
-      </section>
-
-      {/* Testimonials */}
-      <TestimonialsSection />
-
-      {/* FAQ */}
-      <FAQSection />
-
-      {/* Final Call to Action */}
-      <section className="relative z-10 mx-auto max-w-5xl px-6 py-24 border-t border-[var(--border-glass)]">
-        <div className="glass-strong rounded-3xl p-10 text-center shadow-[0_24px_64px_rgba(0,0,0,0.3)] border border-[var(--border-glass)]">
-          <h2 className="font-[family-name:var(--font-heading)] text-3xl md:text-5xl font-bold tracking-tight [text-wrap:balance]">
-            Stop losing receipts.
-            <br />
-            <span className="gradient-text">Start with Buddysaradhi.</span>
-          </h2>
-          <p className="mt-6 text-[var(--text-secondary)] max-w-xl mx-auto text-sm md:text-base leading-relaxed">
-            Free up to 25 students. No credit card required. Works offline, runs on your local hardware, syncs when you need it.
-          </p>
-          <div className="mt-8 flex flex-col gap-4 sm:flex-row sm:justify-center">
-            <a
-              href={`${APP_URL}/signup`}
-              className="inline-flex min-h-[48px] px-8 items-center justify-center rounded-xl bg-[var(--accent-emerald)] text-[var(--text-on-accent)] font-bold text-sm no-underline hover:brightness-110 transition-all"
-            >
-              Get started for free
-            </a>
-            <a
-              href={`${APP_URL}/login`}
-              className="inline-flex min-h-[48px] px-8 items-center justify-center rounded-xl border border-[var(--border-glass)] text-[var(--text-primary)] font-bold text-sm no-underline hover:bg-[var(--surface-glass)] transition-all"
-            >
-              Sign in to your portal
-            </a>
-          </div>
-        </div>
-      </section>
-
-      {/* Sitemap Footer */}
-      <footer className="relative z-10 border-t border-[var(--border-glass)] bg-[var(--surface-glass)] backdrop-blur-md w-full">
-        <div className="mx-auto max-w-6xl px-6 py-12 grid gap-8 md:grid-cols-4">
+      <section
+        id="access"
+        aria-label="Getting access"
+        // `tabIndex={-1}` so the hero's "Skip the story" anchor has somewhere to
+        // put the keyboard when a browser moves focus to the fragment target. It
+        // adds no tab stop, and `:focus-visible` does not match it, so no ring
+        // appears for a pointer user.
+        tabIndex={-1}
+        className="mx-auto w-full max-w-6xl px-6 pb-20"
+      >
+        <div className="panel grid gap-8 p-8 md:grid-cols-[1.2fr_1fr] md:p-10">
           <div>
-            <div className="flex items-center gap-2 font-[family-name:var(--font-heading)] text-lg font-semibold">
-              <span
-                aria-hidden="true"
-                className="h-2 w-2 rounded-full bg-[var(--accent-emerald)]"
-              />
-              buddysaradhi
-            </div>
-            <p className="mt-3 text-sm text-[var(--text-secondary)]">
-              Five screens. Seven engines. One ledger. Zero servers.
+            <h2 className="font-display text-3xl font-bold text-balance md:text-4xl">
+              Free while our infrastructure stays free.
+            </h2>
+            <p className="mt-4 max-w-[60ch] text-pretty text-[var(--text-secondary)]">
+              The free plan needs no contract and nobody to reply to, so you can be inside the app
+              today. Running a coaching institute? Ask us for a contracted plan and the dashboard
+              reports across your whole roster. Staff accounts are not in the build yet. Either way
+              nothing is charged on this site and no card is ever asked for.
             </p>
           </div>
-          <div>
-            <span className="text-xs uppercase font-semibold text-[var(--text-muted)] tracking-wider">Product</span>
-            <ul className="mt-3 space-y-2 text-sm text-[var(--text-secondary)] list-none pl-0">
-              <li>
-                <a className="text-[var(--text-secondary)] no-underline hover:text-[var(--accent-emerald)]" href="#features">
-                  Features
+          <div className="flex flex-col items-start justify-center gap-3 md:items-stretch">
+            {/* The primary action of this page, and the only one in the section.
+                Free self-serve sign-up is the only path on this surface that
+                completes immediately: `POST /api/access-request` validates,
+                persists to the console store and returns a receipt, while mail
+                delivery to a person is not connected
+                (src/app/api/access-request/route.ts), so an access request is
+                a genuine offer — it just is not the first thing to ask a
+                visitor who has not decided
+                (docs/design/marketing-claims-audit.md §4.1, option (b)). The
+                words are shared with `/pricing`, `/platforms` and the hero so the
+                same offer is never spelled two ways. */}
+            <a href={APP_SIGNUP_URL} className="btn btn-primary w-full text-base" rel="noopener">
+              {FREE_SIGNUP_CTA}
+            </a>
+            <p className="mt-1 text-sm text-pretty text-[var(--text-muted)]">{FREE_SIGNUP_NOTE}</p>
+            <div className="mt-2 flex flex-col items-start gap-2 md:items-stretch">
+              <Link
+                href="/request-access"
+                className="action inline-flex min-h-[44px] items-center"
+              >
+                {CONTRACTED_PLAN_CTA}
+              </Link>
+              <Link href="/pricing" className="action inline-flex min-h-[44px] items-center">
+                See plans and billing periods
+              </Link>
+              <p className="text-sm text-[var(--text-muted)]">
+                Already have access?{" "}
+                <a href={APP_LOGIN_URL} className="action" rel="noopener">
+                  Sign in to the app
                 </a>
-              </li>
-              <li>
-                <a className="text-[var(--text-secondary)] no-underline hover:text-[var(--accent-emerald)]" href="#pricing">
-                  Pricing
-                </a>
-              </li>
-              <li>
-                <a className="text-[var(--text-secondary)] no-underline hover:text-[var(--accent-emerald)]" href={`${APP_URL}/signup`}>
-                  Sign up
-                </a>
-              </li>
-            </ul>
-          </div>
-          <div>
-            <span className="text-xs uppercase font-semibold text-[var(--text-muted)] tracking-wider">Company</span>
-            <ul className="mt-3 space-y-2 text-sm text-[var(--text-secondary)] list-none pl-0">
-              <li>
-                <a className="text-[var(--text-secondary)] no-underline hover:text-[var(--accent-emerald)]" href="mailto:hello@buddysaradhi.app">
-                  Contact
-                </a>
-              </li>
-              <li>
-                <a className="text-[var(--text-secondary)] no-underline hover:text-[var(--accent-emerald)]" href={APP_URL}>
-                  Web app
-                </a>
-              </li>
-            </ul>
-          </div>
-          <div>
-            <span className="text-xs uppercase font-semibold text-[var(--text-muted)] tracking-wider">Legal</span>
-            <ul className="mt-3 space-y-2 text-sm text-[var(--text-secondary)] list-none pl-0">
-              <li>
-                <a className="text-[var(--text-secondary)] no-underline hover:text-[var(--accent-emerald)]" href="/privacy">
-                  Privacy
-                </a>
-              </li>
-              <li>
-                <a className="text-[var(--text-secondary)] no-underline hover:text-[var(--accent-emerald)]" href="/terms">
-                  Terms
-                </a>
-              </li>
-              <li>
-                <a className="text-[var(--text-secondary)] no-underline hover:text-[var(--accent-emerald)]" href="/dpa">
-                  DPA
-                </a>
-              </li>
-            </ul>
+                .
+              </p>
+            </div>
           </div>
         </div>
-        <div className="border-t border-[var(--border-glass)]">
-          <div className="mx-auto max-w-6xl px-6 py-4 text-xs text-[var(--text-muted)]">
-            © 2026 Buddysaradhi. Built with Vibrant Glass.
-          </div>
-        </div>
-      </footer>
-    </main>
+      </section>
+    </>
   );
 }

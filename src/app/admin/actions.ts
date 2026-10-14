@@ -1,72 +1,583 @@
+// Implements: docs/design/overhaul-plan.md §4.2 — every admin mutation, as a
+// server action.
+//
+// Four rules hold across this whole file:
+//
+//   1. AUTH FIRST. Every action starts with `currentAdminIdentity()`, which
+//      re-verifies the signed cookie against the live allowlist and throws
+//      `AdminAuthError` when the console is unconfigured or the session is gone.
+//      No action mutates before that check.
+//   2. AUDIT EVERY MUTATION. Each action writes an `audit_log` row in its own
+//      body. A mutation that cannot be audited does not happen: the audit call
+//      is never wrapped in a catch (BR-SEC-03, Rule 9).
+//   3. NO PAYMENT UI. No amount field, no card field, no charge, no provider call
+//      anywhere in this product (owner rule 2).
+//   4. NO TENANT DATA. Nothing read or written here comes from a tenant's
+//      database. The repositories hold contract metadata only.
+//
+// Every action ends in a redirect, so the re-render comes from the server with
+// no client-side cache to go stale. Operate mode: the URL is the state.
+
 "use server";
 
-import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { db } from "../../lib/db";
-import { verifyPassword } from "../../lib/adminAuth";
-import { createHmac } from "crypto";
+import { cookies, headers } from "next/headers";
+import {
+  ADMIN_COOKIE,
+  AdminAuthError,
+  assertSignInAllowed,
+  clearSignInFailures,
+  currentAdminIdentity,
+  mintSessionToken,
+  normaliseIdentity,
+  passphraseMatches,
+  readAdminConfig,
+  recordSignInFailure,
+} from "./_lib/auth";
+import { adminAudit } from "./_lib/audit";
+import { adminLogInfo, adminLogWarn } from "./_lib/log";
+import {
+  AdminRecordNotFound,
+  isBillingPeriod,
+  isPlanId,
+  isSubscriptionStatus,
+  subscriptions,
+} from "./_lib/subscriptions";
+import { entitlements, isBooleanGrant, isFeatureFlag, readGrant } from "./_lib/entitlements";
+import { exportRequests, isExportRequestState, ExportTransitionRefused } from "./_lib/exports";
+import { ReminderTransitionRefused, isReminderAdvance, reminders } from "./_lib/reminders";
+import {
+  AccessRequestNotFound,
+  AccessRequestTransitionRefused,
+  accessRequests,
+  isAccessRequestAdvance,
+} from "./_lib/access-requests";
+import { enforceDowngrade } from "./_lib/engine";
+import { isIsoDate } from "./_lib/format";
+import { NUMERIC_GRANTS, NUMERIC_GRANT_BOUNDS } from "./_lib/types";
+import type { AdminErrorCode, NumericGrant } from "./_lib/types";
 
-const COOKIE_NAME = "bs_admin_session";
-const SESSION_SECRET = process.env.GATEWAY_SHARED_SECRET || "buddysaradhi-dev-secret-key-128bits";
+const MAX_TEXT_LENGTH = 500;
+const MAX_DETAIL_LENGTH = 180;
 
-function signSessionPayload(username: string): string {
-  const payload = JSON.stringify({ username, exp: Date.now() + 24 * 60 * 60 * 1000 });
-  const signature = createHmac("sha256", SESSION_SECRET).update(payload).digest("hex");
-  return `${Buffer.from(payload).toString("base64")}.${signature}`;
+function field(formData: FormData, name: string): string {
+  const value = formData.get(name);
+  return typeof value === "string" ? value.trim() : "";
 }
 
-export async function adminLoginAction(prevState: any, formData: FormData) {
-  const username = formData.get("username") as string;
-  const password = formData.get("password") as string;
-  
-  if (!username || !password) {
-    return { error: "Please enter both username and password." };
+function clientIp(source: Headers): string {
+  const forwarded = source.get("x-forwarded-for");
+  if (forwarded !== null && forwarded.length > 0) {
+    const first = forwarded.split(",")[0];
+    if (first !== undefined) return first.trim();
   }
-  
+  return "unknown";
+}
+
+/** Typed input refusal. Never silent, never a partial write. */
+class AdminInputRefused extends Error {
+  readonly detail: string;
+
+  constructor(detail: string) {
+    super(detail);
+    this.name = "AdminInputRefused";
+    this.detail = detail;
+  }
+}
+
+function backTo(path: string, params: Readonly<Record<string, string>>): string {
+  return `${path}?${new URLSearchParams(params).toString()}`;
+}
+
+function loginRedirect(error: AdminAuthError): string {
+  const code: AdminErrorCode =
+    error.code === "ADMIN_AUTH_UNCONFIGURED"
+      ? "unconfigured"
+      : error.code === "ADMIN_RATE_LIMITED"
+        ? "rate_limited"
+        : "not_allowed";
+  return backTo("/admin/login", { error: code });
+}
+
+/** Same attributes the live cookie was set with, or the browser keeps it. */
+function clearCookieOptions(): {
+  readonly httpOnly: true;
+  readonly sameSite: "lax";
+  readonly secure: boolean;
+  readonly path: string;
+  readonly maxAge: number;
+} {
+  return {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: process.env.NODE_ENV === "production",
+    path: "/admin",
+    maxAge: 0,
+  };
+}
+
+// --- sign in / sign out -----------------------------------------------------
+
+export async function signInAction(formData: FormData): Promise<void> {
+  const requestHeaders = await headers();
+  const ip = clientIp(requestHeaders);
+  const rawEmail = field(formData, "email");
+  const passphrase = field(formData, "passphrase");
+  const email = normaliseIdentity(rawEmail);
+
+  let nextPath: string;
   try {
-    const user = await db.adminUser.findUnique({ where: { username } });
-    if (!user || !verifyPassword(password, user.password)) {
-      return { error: "Invalid username or password credentials." };
+    const config = readAdminConfig();
+    assertSignInAllowed(email, ip, Date.now());
+
+    if (!config.allowlist.has(email)) {
+      recordSignInFailure(email, ip, Date.now());
+      adminLogWarn("admin.sign_in_not_allowed", { email, ip });
+      nextPath = backTo("/admin/login", { error: "not_allowed", email: rawEmail });
+    } else if (!passphraseMatches(passphrase, config)) {
+      recordSignInFailure(email, ip, Date.now());
+      nextPath = backTo("/admin/login", { error: "bad_credentials", email: rawEmail });
+    } else {
+      clearSignInFailures(email, ip);
+      const jar = await cookies();
+      jar.set(ADMIN_COOKIE, mintSessionToken(email, config, Date.now()), {
+        httpOnly: true,
+        sameSite: "lax",
+        secure: process.env.NODE_ENV === "production",
+        path: "/admin",
+        maxAge: Math.floor(config.ttlMs / 1000),
+      });
+      await adminAudit({
+        actor: email,
+        action: "admin.sign_in",
+        refType: "admin_session",
+        metadata: { ttlMinutes: Math.round(config.ttlMs / 60_000) },
+      });
+      adminLogInfo("admin.sign_in", { email });
+      nextPath = "/admin/subscriptions";
     }
-    
-    const token = signSessionPayload(username);
-    const cookieStore = await cookies();
-    cookieStore.set(COOKIE_NAME, token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
-      sameSite: "lax",
-      maxAge: 60 * 60 * 24 // 24 hours
-    });
-  } catch (err) {
-    return { error: "An error occurred during authentication verification." };
+  } catch (error) {
+    if (error instanceof AdminAuthError) {
+      adminLogWarn("admin.sign_in_refused", { code: error.code });
+      nextPath = loginRedirect(error);
+    } else {
+      throw error;
+    }
   }
-  
-  redirect("/admin/dashboard");
+
+  redirect(nextPath);
 }
 
-export async function adminLogoutAction() {
-  const cookieStore = await cookies();
-  cookieStore.delete(COOKIE_NAME);
-  redirect("/admin/login");
-}
-
-export async function getAdminSession(): Promise<string | null> {
-  const cookieStore = await cookies();
-  const token = cookieStore.get(COOKIE_NAME)?.value;
-  if (!token) return null;
-  
-  const [payloadBase64, signature] = token.split(".");
-  if (!payloadBase64 || !signature) return null;
-  
-  const payloadStr = Buffer.from(payloadBase64, "base64").toString("utf-8");
-  const computedSignature = createHmac("sha256", SESSION_SECRET).update(payloadStr).digest("hex");
-  if (computedSignature !== signature) return null;
-  
+export async function signOutAction(): Promise<void> {
+  let actor = "unknown";
   try {
-    const payload = JSON.parse(payloadStr);
-    if (payload.exp < Date.now()) return null;
-    return payload.username;
-  } catch {
-    return null;
+    const identity = await currentAdminIdentity();
+    actor = identity.email;
+    await adminAudit({ actor, action: "admin.sign_out", refType: "admin_session" });
+  } catch (error) {
+    if (!(error instanceof AdminAuthError)) throw error;
+    adminLogWarn("admin.sign_out_without_session", { code: error.code });
   }
+
+  const jar = await cookies();
+  jar.set(ADMIN_COOKIE, "", clearCookieOptions());
+  adminLogInfo("admin.sign_out", { email: actor });
+  redirect("/admin/login?signed-out=1");
+}
+
+// --- subscriptions ----------------------------------------------------------
+
+export async function updateSubscriptionAction(formData: FormData): Promise<void> {
+  const tenantId = field(formData, "tenantId");
+  let nextPath: string;
+  try {
+    const admin = await currentAdminIdentity();
+    const plan = field(formData, "plan");
+    const period = field(formData, "period");
+    const status = field(formData, "status");
+    const startsOn = field(formData, "startsOn");
+    const expiresOn = field(formData, "expiresOn");
+    const adminNote = field(formData, "adminNote").slice(0, MAX_TEXT_LENGTH);
+
+    if (tenantId.length === 0) throw new AdminInputRefused("A tenant id is required.");
+    if (!isPlanId(plan)) throw new AdminInputRefused(`Unknown plan: ${plan || "(empty)"}`);
+    if (!isBillingPeriod(period)) throw new AdminInputRefused(`Unknown period: ${period || "(empty)"}`);
+    if (!isSubscriptionStatus(status)) throw new AdminInputRefused(`Unknown status: ${status || "(empty)"}`);
+    if (!isIsoDate(startsOn)) throw new AdminInputRefused(`Start date is not a date: ${startsOn || "(empty)"}`);
+    if (!isIsoDate(expiresOn)) throw new AdminInputRefused(`Expiry date is not a date: ${expiresOn || "(empty)"}`);
+    if (expiresOn <= startsOn) throw new AdminInputRefused("The expiry date must be after the start date.");
+
+    const before = await subscriptions().get(tenantId);
+    if (before === null) throw new AdminRecordNotFound(`No subscription for ${tenantId}.`);
+
+    const after = await subscriptions().apply(tenantId, { plan, period, status, startsOn, expiresOn, adminNote }, admin.email);
+
+    await adminAudit({
+      actor: admin.email,
+      action: "admin.subscription.update",
+      refType: "subscription",
+      refId: tenantId,
+      metadata: {
+        plan: { from: before.plan, to: after.plan },
+        period: { from: before.period, to: after.period },
+        status: { from: before.status, to: after.status },
+        startsOn: { from: before.startsOn, to: after.startsOn },
+        expiresOn: { from: before.expiresOn, to: after.expiresOn },
+      },
+    });
+
+    nextPath = backTo("/admin/subscriptions", { tenant: tenantId, notice: "subscription-updated" });
+  } catch (error) {
+    if (error instanceof AdminAuthError) {
+      redirect(loginRedirect(error));
+    }
+    if (error instanceof AdminInputRefused) {
+      redirect(backTo("/admin/subscriptions", { tenant: tenantId, error: "invalid_input", detail: error.detail.slice(0, MAX_DETAIL_LENGTH) }));
+    }
+    if (error instanceof AdminRecordNotFound) {
+      redirect(backTo("/admin/subscriptions", { tenant: tenantId, error: "not_found" }));
+    }
+    throw error;
+  }
+
+  redirect(nextPath);
+}
+
+// --- entitlements -----------------------------------------------------------
+
+export async function setFeatureFlagAction(formData: FormData): Promise<void> {
+  const tenantId = field(formData, "tenantId");
+  let nextPath: string;
+  try {
+    const admin = await currentAdminIdentity();
+    const flag = field(formData, "flag");
+    const enabled = field(formData, "enabled") === "1";
+
+    if (tenantId.length === 0) throw new AdminInputRefused("A tenant id is required.");
+    if (!isFeatureFlag(flag)) throw new AdminInputRefused(`Unknown feature flag: ${flag || "(empty)"}`);
+    const before = await entitlements().get(tenantId);
+    if (before === null) throw new AdminRecordNotFound(`No entitlements for ${tenantId}.`);
+
+    await entitlements().setFlag(tenantId, flag, enabled, admin.email);
+    await adminAudit({
+      actor: admin.email,
+      action: "admin.entitlement.flag_set",
+      refType: "entitlement",
+      refId: tenantId,
+      metadata: { flag, from: before.flags[flag], to: enabled },
+    });
+
+    nextPath = backTo("/admin/entitlements", { tenant: tenantId, notice: "entitlement-flag-set" });
+  } catch (error) {
+    if (error instanceof AdminAuthError) {
+      redirect(loginRedirect(error));
+    }
+    if (error instanceof AdminInputRefused) {
+      redirect(backTo("/admin/entitlements", { tenant: tenantId, error: "invalid_input", detail: error.detail.slice(0, MAX_DETAIL_LENGTH) }));
+    }
+    if (error instanceof AdminRecordNotFound) {
+      redirect(backTo("/admin/entitlements", { tenant: tenantId, error: "not_found" }));
+    }
+    throw error;
+  }
+
+  redirect(nextPath);
+}
+
+export async function setInfrastructureGrantAction(formData: FormData): Promise<void> {
+  const tenantId = field(formData, "tenantId");
+  let nextPath: string;
+  try {
+    const admin = await currentAdminIdentity();
+    const grant = field(formData, "grant");
+    const rawValue = field(formData, "value");
+
+    if (tenantId.length === 0) throw new AdminInputRefused("A tenant id is required.");
+
+    const boolean = isBooleanGrant(grant);
+    const numeric = !boolean && (NUMERIC_GRANTS as readonly string[]).includes(grant);
+    if (!boolean && !numeric) throw new AdminInputRefused(`Unknown grant: ${grant || "(empty)"}`);
+
+    const before = await entitlements().get(tenantId);
+    if (before === null) throw new AdminRecordNotFound(`No entitlements for ${tenantId}.`);
+
+    let value: boolean | number;
+    if (boolean) {
+      value = rawValue === "1";
+    } else {
+      const key = grant as NumericGrant;
+      const parsed = Number.parseInt(rawValue, 10);
+      const bounds = NUMERIC_GRANT_BOUNDS[key];
+      if (!Number.isFinite(parsed)) throw new AdminInputRefused(`${grant} must be a whole number.`);
+      if (parsed < bounds.min || parsed > bounds.max) {
+        throw new AdminInputRefused(`${grant} must be between ${bounds.min} and ${bounds.max}.`);
+      }
+      value = parsed;
+    }
+
+    // SAFETY: both branches above narrow `grant` to a key of
+    // `InfrastructureGrants`, so `readGrant` can index it directly.
+    const previousValue = readGrant(before, boolean ? grant : (grant as NumericGrant));
+    const after = await entitlements().setGrant(tenantId, boolean ? grant : (grant as NumericGrant), value, admin.email);
+
+    await adminAudit({
+      actor: admin.email,
+      action: "admin.entitlement.grant_set",
+      refType: "entitlement",
+      refId: tenantId,
+      metadata: { grant, from: previousValue, to: value, storageQuotaMb: after.infrastructure.storageQuotaMb },
+    });
+
+    nextPath = backTo("/admin/entitlements", { tenant: tenantId, notice: "entitlement-grant-set" });
+  } catch (error) {
+    if (error instanceof AdminAuthError) {
+      redirect(loginRedirect(error));
+    }
+    if (error instanceof AdminInputRefused) {
+      redirect(backTo("/admin/entitlements", { tenant: tenantId, error: "invalid_input", detail: error.detail.slice(0, MAX_DETAIL_LENGTH) }));
+    }
+    if (error instanceof AdminRecordNotFound) {
+      redirect(backTo("/admin/entitlements", { tenant: tenantId, error: "not_found" }));
+    }
+    throw error;
+  }
+
+  redirect(nextPath);
+}
+
+// --- access requests (console-owned inbox) ------------------------------------
+
+export async function advanceAccessRequestAction(formData: FormData): Promise<void> {
+  const requestId = field(formData, "requestId");
+  let nextPath: string;
+  try {
+    const admin = await currentAdminIdentity();
+    const to = field(formData, "advance");
+    if (requestId.length === 0) throw new AdminInputRefused("An access request id is required.");
+    if (!isAccessRequestAdvance(to)) throw new AdminInputRefused(`Unknown access request step: ${to || "(empty)"}`);
+
+    const before = await accessRequests().get(requestId);
+    if (before === null) throw new AccessRequestNotFound(`No access request ${requestId}.`);
+
+    const after = await accessRequests().setState(requestId, to, admin.email, new Date().toISOString());
+    await adminAudit({
+      actor: admin.email,
+      action: "admin.access_request.state_set",
+      refType: "access_request",
+      refId: requestId,
+      metadata: { reference: before.reference, from: before.state, to: after.state },
+    });
+
+    nextPath = backTo("/admin/requests", { notice: "access-request-advanced" });
+  } catch (error) {
+    if (error instanceof AdminAuthError) {
+      redirect(loginRedirect(error));
+    }
+    if (error instanceof AccessRequestTransitionRefused) {
+      redirect(backTo("/admin/requests", { error: "conflict", detail: error.message.slice(0, MAX_DETAIL_LENGTH) }));
+    }
+    if (error instanceof AdminInputRefused) {
+      redirect(backTo("/admin/requests", { error: "invalid_input", detail: error.detail.slice(0, MAX_DETAIL_LENGTH) }));
+    }
+    if (error instanceof AccessRequestNotFound) {
+      redirect(backTo("/admin/requests", { error: "not_found" }));
+    }
+    throw error;
+  }
+
+  redirect(nextPath);
+}
+
+// --- export requests (metadata only) ----------------------------------------
+
+export async function requestExportAction(formData: FormData): Promise<void> {
+  let nextPath: string;
+  try {
+    const admin = await currentAdminIdentity();
+    const tenantId = field(formData, "tenantId");
+    const windowHours = Number.parseInt(field(formData, "windowHours"), 10);
+
+    if (tenantId.length === 0) throw new AdminInputRefused("A tenant id is required.");
+    if ((await subscriptions().get(tenantId)) === null) throw new AdminRecordNotFound(`No subscription for ${tenantId}.`);
+    if (!Number.isFinite(windowHours) || windowHours < 1 || windowHours > 720) {
+      throw new AdminInputRefused("The download window must be between 1 and 720 hours.");
+    }
+
+    const created = await exportRequests().request(tenantId, windowHours, admin.email, new Date().toISOString());
+    await adminAudit({
+      actor: admin.email,
+      action: "admin.export.request",
+      refType: "export_request",
+      refId: created.id,
+      metadata: { tenantId, windowHours, state: created.state, sizeBytes: null, sha256: null },
+    });
+
+    nextPath = backTo("/admin/exports", { notice: "export-requested" });
+  } catch (error) {
+    if (error instanceof AdminAuthError) {
+      redirect(loginRedirect(error));
+    }
+    if (error instanceof AdminInputRefused) {
+      redirect(backTo("/admin/exports", { error: "invalid_input", detail: error.detail.slice(0, MAX_DETAIL_LENGTH) }));
+    }
+    if (error instanceof AdminRecordNotFound) {
+      redirect(backTo("/admin/exports", { error: "not_found" }));
+    }
+    throw error;
+  }
+
+  redirect(nextPath);
+}
+
+export async function revokeExportAction(formData: FormData): Promise<void> {
+  const exportId = field(formData, "exportId");
+  let nextPath: string;
+  try {
+    const admin = await currentAdminIdentity();
+    const before = await exportRequests().get(exportId);
+    if (before === null) throw new AdminRecordNotFound(`No export request ${exportId}.`);
+
+    const after = await exportRequests().revoke(exportId, admin.email, new Date().toISOString());
+    await adminAudit({
+      actor: admin.email,
+      action: "admin.export.revoke",
+      refType: "export_request",
+      refId: exportId,
+      metadata: { tenantId: before.tenantId, from: before.state, to: after.state },
+    });
+
+    nextPath = backTo("/admin/exports", { notice: "export-revoked" });
+  } catch (error) {
+    if (error instanceof AdminAuthError) {
+      redirect(loginRedirect(error));
+    }
+    if (error instanceof AdminRecordNotFound) {
+      redirect(backTo("/admin/exports", { error: "not_found" }));
+    }
+    throw error;
+  }
+
+  redirect(nextPath);
+}
+
+// --- reminders --------------------------------------------------------------
+
+export async function advanceReminderAction(formData: FormData): Promise<void> {
+  const tenantId = field(formData, "tenantId");
+  let nextPath: string;
+  try {
+    const admin = await currentAdminIdentity();
+    const to = field(formData, "advance");
+    if (tenantId.length === 0) throw new AdminInputRefused("A tenant id is required.");
+    if (!isReminderAdvance(to)) throw new AdminInputRefused(`Unknown reminder step: ${to || "(empty)"}`);
+
+    const before = await reminders().get(tenantId, new Date().toISOString());
+    if (before === null) throw new AdminRecordNotFound(`No reminder schedule for ${tenantId}.`);
+
+    const after = await reminders().advance(tenantId, to, admin.email, new Date().toISOString());
+    await adminAudit({
+      actor: admin.email,
+      action: "admin.reminder.advance",
+      refType: "reminder",
+      refId: tenantId,
+      metadata: { from: before.stage, to: after.stage, hardReminderCount: 1, downgradeScheduledFor: after.downgradeScheduledFor },
+    });
+
+    nextPath = backTo("/admin/reminders", { notice: "reminder-advanced" });
+  } catch (error) {
+    if (error instanceof AdminAuthError) {
+      redirect(loginRedirect(error));
+    }
+    if (error instanceof ReminderTransitionRefused) {
+      redirect(backTo("/admin/reminders", { error: "conflict", detail: error.message.slice(0, MAX_DETAIL_LENGTH) }));
+    }
+    if (error instanceof AdminInputRefused) {
+      redirect(backTo("/admin/reminders", { error: "invalid_input", detail: error.detail.slice(0, MAX_DETAIL_LENGTH) }));
+    }
+    if (error instanceof AdminRecordNotFound) {
+      redirect(backTo("/admin/reminders", { error: "not_found" }));
+    }
+    throw error;
+  }
+
+  redirect(nextPath);
+}
+
+// --- export packaging queue (metadata transitions) ----------------------------
+
+export async function advanceExportAction(formData: FormData): Promise<void> {
+  const exportId = field(formData, "exportId");
+  let nextPath: string;
+  try {
+    const admin = await currentAdminIdentity();
+    const to = field(formData, "advance");
+    if (exportId.length === 0) throw new AdminInputRefused("An export request id is required.");
+    if (!isExportRequestState(to)) throw new AdminInputRefused(`Unknown export state: ${to || "(empty)"}`);
+
+    const before = await exportRequests().get(exportId);
+    if (before === null) throw new AdminRecordNotFound(`No export request ${exportId}.`);
+
+    // The console moves metadata only: no bytes, no digest, no link. Size and
+    // digest stay whatever the packaging engine wrote (or blank until it has).
+    const after = await exportRequests().advance(exportId, to, admin.email, new Date().toISOString());
+    await adminAudit({
+      actor: admin.email,
+      action: "admin.export.advance",
+      refType: "export_request",
+      refId: exportId,
+      metadata: { tenantId: before.tenantId, from: before.state, to: after.state },
+    });
+
+    nextPath = backTo("/admin/exports", { notice: "export-advanced" });
+  } catch (error) {
+    if (error instanceof AdminAuthError) {
+      redirect(loginRedirect(error));
+    }
+    if (error instanceof ExportTransitionRefused) {
+      redirect(backTo("/admin/exports", { error: "conflict", detail: error.message.slice(0, MAX_DETAIL_LENGTH) }));
+    }
+    if (error instanceof AdminInputRefused) {
+      redirect(backTo("/admin/exports", { error: "invalid_input", detail: error.detail.slice(0, MAX_DETAIL_LENGTH) }));
+    }
+    if (error instanceof AdminRecordNotFound) {
+      redirect(backTo("/admin/exports", { error: "not_found" }));
+    }
+    throw error;
+  }
+
+  redirect(nextPath);
+}
+
+// --- downgrade enforcement ----------------------------------------------------
+
+export async function enforceDowngradeAction(formData: FormData): Promise<void> {
+  const tenantId = field(formData, "tenantId");
+  let nextPath: string;
+  try {
+    const admin = await currentAdminIdentity();
+    if (tenantId.length === 0) throw new AdminInputRefused("A tenant id is required.");
+
+    // The engine owns its audit row (`admin.entitlement.downgrade`): one
+    // enforcement, one traceable write, even though the memory store applies it
+    // as five sequential writes (see _lib/engine.ts for the atomicity limit).
+    await enforceDowngrade({ tenantId, actor: admin.email, nowMs: Date.now() });
+
+    nextPath = backTo("/admin/entitlements", { tenant: tenantId, notice: "entitlement-downgraded" });
+  } catch (error) {
+    if (error instanceof AdminAuthError) {
+      redirect(loginRedirect(error));
+    }
+    if (error instanceof ReminderTransitionRefused) {
+      redirect(backTo("/admin/entitlements", { tenant: tenantId, error: "conflict", detail: error.message.slice(0, MAX_DETAIL_LENGTH) }));
+    }
+    if (error instanceof AdminInputRefused) {
+      redirect(backTo("/admin/entitlements", { tenant: tenantId, error: "invalid_input", detail: error.detail.slice(0, MAX_DETAIL_LENGTH) }));
+    }
+    if (error instanceof AdminRecordNotFound) {
+      redirect(backTo("/admin/entitlements", { tenant: tenantId, error: "not_found" }));
+    }
+    throw error;
+  }
+
+  redirect(nextPath);
 }

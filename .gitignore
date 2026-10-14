@@ -1,25 +1,29 @@
-# Dependency directories
+# Dependencies
 node_modules/
 
 # Next.js build output
 .next/
 out/
+build/
 
-# Vercel configuration and CLI files
-.vercel/
-.env*
+# Vercel
+.vercel
 
-# Local SQLite databases
-*.db
-*.db-journal
-*.db-wal
-*.db-shm
+# TypeScript
+*.tsbuildinfo
 
-# Ignore all planning, documentation and markdown files
-*.md
+# ENV — secrets. This repo is PUBLIC; a committed .env is an irreversible leak
+# in git history even if the file is later deleted.
+.env
+.env.*
+!.env.example
 
-# Ignore scripts and other temporary files
-*.py
-*.js
-*.ps1
-*.sh
+# Local logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+bun-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db
