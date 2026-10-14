@@ -1,0 +1,86 @@
+# CI for the standalone product page (AGENTS.md Rule 11 — one directory, one
+# deployment target; this repo IS that target).
+#
+# WHY THIS FILE EXISTS. The product page was extracted from the monorepo into
+# its own repository. The monorepo's `.github/workflows` did NOT come with it, so
+# for a period this repo had NO CI at all. That is not a theoretical gap: four
+# separate build-breaking defects shipped through this repository undetected
+# before CI existed, and every one of them passed `tsc` and the test suite —
+#
+#   1. `vitest` was only a root monorepo devDependency, so tests/*.test.ts
+#      could not resolve it.  Caught by `typecheck`.
+#   2. The Vitest/node:test boundary lived in the monorepo ROOT vitest config,
+#      which a standalone repo does not inherit, so Vitest claimed two
+#      `node --test` files and failed them.  Caught by `test`.
+#   3. `vercel.json` ran `prisma generate` on an app with no Prisma.  Caught by
+#      `build`.
+#   4. `src/app/globals.css` @import-ed `packages/design-system/tokens.css`, a
+#      monorepo-relative path.  Caught ONLY by `build` — a CSS @import is not a
+#      module import, so typecheck is structurally blind to it.
+#
+# The ordering below is deliberate and mirrors the monorepo's gates. Do not
+# reorder `build` before `test`: defect 4 is invisible to everything except the
+# production build.
+#
+# Actions are pinned to commit SHAs, not tags, per
+# `23_Security_Harness_Plan.md` §5 (S4 — secrets & supply chain). A floating
+# `@v4` in a workflow with `contents: write` is an unpinned remote-code
+# execution surface. The comment after each SHA records the human-readable
+# version for maintainers.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref. Without this a five-gate matrix on a
+# busy branch burns minutes re-testing commits nobody will ship.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read # default-deny: this workflow never writes to the repo
+
+jobs:
+  verify:
+    name: lint · typecheck · test · build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # Bun, because `vercel.json` declares `installCommand: bun install` and
+      # `bun.lock` is the committed lockfile. Using npm/pnpm here would resolve
+      # a different tree than production and defeat the point of the gate.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.2.21
+
+      # `--frozen-lockfile` makes a drifted lockfile a HARD failure instead of a
+      # silent re-resolve. Without it this job would happily install whatever
+      # the registry serves today and report green.
+      - name: Install (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      - name: Lint
+        run: bun run lint
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      # Both runners: `vitest` for tests/**, `node --test` for the admin _lib
+      # suites. `bun run test` chains them; `test:unit` alone would silently
+      # skip the admin logic.
+      - name: Test
+        run: bun run test
+
+      # The only gate that catches a monorepo-relative CSS import, a bad
+      # `outputDirectory`, or a server/client boundary violation. Runs last so
+      # the cheap gates report first.
+      - name: Build
+        run: bun run build
